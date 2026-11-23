@@ -27,7 +27,7 @@
 |---|---|
 | 模组 | Air780EPV_A12 |
 | 芯片 | EC718PV（`am_get_chip_type` 输出） |
-| IMEI | 86xxxxxxxxxxxxx（已脱敏） |
+| IMEI | 86xxxxxxxxxxxxx |
 | 固件 | `LuatOS-SoC_V2003_EC718PV`<br>base 24.10 / bsp V2003 / 编译于 2025-05-13 |
 | SIM | 联通 460/01，Band 3 |
 | 脚本 | `sms-forwarder` v3.5.3 |
