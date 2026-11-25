@@ -1,4 +1,4 @@
-﻿-- main.lua · 短信转发器（v3.2.0 加固版）
+-- main.lua · 短信转发器（v3.2.0 加固版）
 --
 -- 只做一件事：收短信 → 推到 pushplus → 由它转邮件。
 --
@@ -8,7 +8,7 @@
 --   ③ 网络超时 < 看门狗，且绝不自己切飞行模式
 
 PROJECT = "sms-forwarder"
-VERSION = "3.5.3"
+VERSION = "3.7.0"
 
 log.setLevel("INFO")
 
@@ -140,6 +140,11 @@ sys.subscribe("NEW_MSG", function()
     led.blink(1)
 end)
 
+-- 队列满丢消息：闪故障码 5
+sys.subscribe("Q_DROP", function()
+    led.setFault(5)
+end)
+
 util_sms.start()
 
 --============================================================
@@ -161,7 +166,7 @@ sys.taskInit(function()
             elseif not util_net.isReady() then
                 sys.wait(5000)
             else
-                if util_push.send(item) then
+                if util_push.send(item, (tonumber(item.retry) or 0) + 1) then
                     util_queue.pop()
                     log.info("push", "成功, 剩余=" .. util_queue.count())
                     led.blink(2)    -- 发送成功，插播 2 下
@@ -169,7 +174,8 @@ sys.taskInit(function()
                     util_queue.pop()
                     item.retry = (tonumber(item.retry) or 0) + 1
                     if item.retry > (tonumber(config.RETRY_MAX) or 5) then
-                        log.error("push", "重试超限，放弃这条")
+                        log.error("push", "重试超限，放弃这条（消息已丢）")
+                        led.setFault(5)
                     else
                         util_queue.push(item)
                         log.warn("push", "失败, 第 " .. item.retry .. " 次重试")

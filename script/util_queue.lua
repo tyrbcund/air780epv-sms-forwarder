@@ -78,6 +78,8 @@ function util_queue.push(item)
         fskv.set(KEY_HEAD, head)
         cnt = cnt - 1
         log.warn("queue", "满, 丢最旧一条")
+        -- 通知 LED：丢消息了（这是唯一不可逆的损失，必须让你看得见）
+        sys.publish("Q_DROP")
     end
 
     local ok = pcall(fskv.set, slot(head + cnt), encode(item))
