@@ -34,6 +34,8 @@ local ACTIVE = tonumber(config.LED_ACTIVE) or 1
 local ready   = false
 local pending = 0    -- 插播次数（收到短信 / 发送成功）
 local fault   = 0    -- 当前故障码
+local alertUntil = 0 -- 丢消息告警窗口截止时刻（mcu.ticks）
+local beat = 0       -- 心跳计数，用于每 10 秒插一次告警
 
 local function on()
     if ready then util_lib.call(gpio, "set", PIN, ACTIVE) end
@@ -83,6 +85,19 @@ function led.getFault()
     return fault
 end
 
+--- 丢消息告警：接下来 minutes 分钟内，慢闪里每 10 秒插 3 下
+function led.setAlert(minutes)
+    minutes = tonumber(minutes) or 0
+    if minutes <= 0 then return end
+    local now = 0
+    if mcu and mcu.ticks then
+        local ok, t = pcall(mcu.ticks)
+        if ok and t then now = t end
+    end
+    alertUntil = now + minutes * 60000
+    log.warn("led", "丢消息告警 " .. minutes .. " 分钟")
+end
+
 -- 闪 n 下（120ms 节奏）
 local function burst(n)
     for _ = 1, n do
@@ -122,7 +137,20 @@ function led.start()
                         sys.wait(1500)
                     end
                 else
-                    -- 正常：2 秒 1 次
+                    -- 正常：2 秒 1 次；若有丢消息告警，每 10 秒插 3 下
+                    beat = beat + 1
+                    if alertUntil > 0 then
+                        local now = 0
+                        if mcu and mcu.ticks then
+                            local okT, t = pcall(mcu.ticks)
+                            if okT and t then now = t end
+                        end
+                        if now >= alertUntil then
+                            alertUntil = 0
+                        elseif beat % 5 == 0 then
+                            burst = burst + 3     -- 告警提示：丢过消息
+                        end
+                    end
                     on();  sys.wait(100)
                     off(); sys.wait(1900)
                 end

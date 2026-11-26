@@ -1,4 +1,4 @@
--- main.lua · 短信转发器（v3.2.0 加固版）
+﻿-- main.lua · 短信转发器（v3.2.0 加固版）
 --
 -- 只做一件事：收短信 → 推到 pushplus → 由它转邮件。
 --
@@ -8,7 +8,7 @@
 --   ③ 网络超时 < 看门狗，且绝不自己切飞行模式
 
 PROJECT = "sms-forwarder"
-VERSION = "3.7.0"
+VERSION = "4.1.0"
 
 log.setLevel("INFO")
 
@@ -53,6 +53,46 @@ local function uptimeMin()
     return -1
 end
 
+local function uptimeMs()
+    if mcu and mcu.ticks then
+        local ok, t = pcall(mcu.ticks)
+        if ok and t then return t end
+    end
+    return 0
+end
+
+-- 重启：优先 rtos.restart，退而求其次 rtos.reboot
+local function doRestart(reason)
+    log.error("main", "===== 重启设备: " .. tostring(reason) .. " =====")
+    sys.wait(500)
+    local done = false
+    if rtos and rtos.restart then done = pcall(rtos.restart) end
+    if not done and rtos and rtos.reboot then pcall(rtos.reboot) end
+end
+
+-- 重建网络（轻量）：重置协议栈 + 开关飞行模式，几秒就好，队列不丢
+-- 这是自愈的主力手段，参考 lageev/air780e-forwarder
+local lastNetReset = 0
+local function doNetReset(reason)
+    if mobile == nil or mobile.flymode == nil then return end
+
+    local now = uptimeMs()
+    local gap = tonumber(config.FLYMODE_MIN_GAP_MS) or 60000
+    if now > 0 and lastNetReset > 0 and (now - lastNetReset) < gap then
+        log.warn("net", "距上次重建不足 " .. math.floor(gap / 1000) .. " 秒，跳过")
+        return
+    end
+    lastNetReset = now
+
+    log.warn("net", "===== 重建网络: " .. tostring(reason) .. " =====")
+    pcall(function() mobile.reset() end)
+    sys.wait(1000)
+    pcall(function() mobile.flymode(0, true) end)
+    sys.wait(1500)
+    pcall(function() mobile.flymode(0, false) end)
+    log.info("net", "网络重建完成")
+end
+
 log.info("main", PROJECT, VERSION, fwVersion())
 local missing = capsReport()
 
@@ -79,9 +119,11 @@ end
 
 --============================================================
 -- 网络自愈交给固件（可选）
+-- 参数参考 lageev/air780e-forwarder：检测周期 30 秒（比原来的 300 秒积极 10 倍）
 --============================================================
 if mobile and mobile.setAuto then
-    pcall(mobile.setAuto, 10000, 300000, 8, true, 120000)
+    pcall(mobile.setAuto, 10000, 30000, 8, true, 60000)
+    log.info("main", "网络自愈参数: 30 秒检测")
 else
     log.warn("main", "无 mobile.setAuto，网络自愈依赖固件默认")
 end
@@ -131,6 +173,66 @@ led        = require "led"
 
 util_queue.init()
 
+--============================================================
+-- 小区重选门限：弱信号时更愿意换小区（ageev 项目验证过的做法）
+-- 必须在飞行模式下改，否则不生效；放在 config 加载之后
+--============================================================
+sys.taskInit(function()
+    sys.wait(60000)
+    local weak = tonumber(config.RESEL_WEAK_CELL) or 0
+    if weak <= 0 then return end
+    if not (mobile and mobile.flymode and mobile.config) then
+        log.warn("net", "无 mobile.config/flymode，跳过小区重选调整")
+        return
+    end
+    local ok, err = pcall(function()
+        log.info("net", "调整小区重选门限: " .. weak)
+        mobile.flymode(0, true)
+        sys.wait(800)
+        pcall(function() mobile.config(mobile.CONF_RESELTOWEAKNCELL, weak) end)
+        pcall(function() mobile.config(mobile.CONF_STATICCONFIG, 1) end)
+        sys.wait(200)
+        mobile.flymode(0, false)
+        log.info("net", "小区重选门限已设置")
+    end)
+    if not ok then log.warn("net", "小区调整失败: " .. tostring(err)) end
+end)
+
+local failStreak = 0          -- 连续推送失败次数（成功即清零）
+local rebootWindowStart = 0   -- 自愈重启的 24 小时窗口起点
+local rebootInWindow = 0      -- 本窗口内已自愈重启次数
+
+--============================================================
+-- 定时切飞行模式重建网络
+--   比整机重启温和：几秒就好、队列不丢。
+--   队列里有待发消息时先延后，避免打断正在重试的发送。
+--============================================================
+local flyIv = tonumber(config.FLYMODE_INTERVAL) or 0
+if flyIv > 0 and mobile and mobile.flymode then
+    log.info("net", "定时切飞行模式: 每 " .. math.floor(flyIv / 3600000) .. " 小时")
+    sys.timerLoopStart(function()
+        sys.taskInit(function()
+            local deferMs = tonumber(config.FLYMODE_DEFER_MS) or 600000
+            local deferMax = tonumber(config.FLYMODE_DEFER_MAX) or 3
+            local waited = 0
+            while util_queue.count() > 0 and waited < deferMax do
+                log.warn("net", "有待发消息，延后切飞行模式")
+                sys.wait(deferMs)
+                waited = waited + 1
+            end
+            log.info("net", "切飞行模式重建网络")
+            pcall(function() mobile.reset() end)
+            sys.wait(1000)
+            pcall(function() mobile.flymode(0, true) end)
+            sys.wait(1500)
+            pcall(function() mobile.flymode(0, false) end)
+            log.info("net", "飞行模式切换完成")
+        end)
+    end, flyIv)
+else
+    log.info("net", "定时切飞行模式: 已关闭")
+end
+
 -- 状态灯：慢闪=正常 / 快闪=没网 / 双闪=有积压 / 灭=死了
 led.init()
 led.start()
@@ -140,9 +242,10 @@ sys.subscribe("NEW_MSG", function()
     led.blink(1)
 end)
 
--- 队列满丢消息：闪故障码 5
+-- 队列满丢消息：闪故障码 5 + 开启告警窗口
 sys.subscribe("Q_DROP", function()
     led.setFault(5)
+    led.setAlert(tonumber(config.LOST_ALERT_MINUTES) or 0)
 end)
 
 util_sms.start()
@@ -170,16 +273,46 @@ sys.taskInit(function()
                     util_queue.pop()
                     log.info("push", "成功, 剩余=" .. util_queue.count())
                     led.blink(2)    -- 发送成功，插播 2 下
+                    failStreak = 0
                 else
                     util_queue.pop()
                     item.retry = (tonumber(item.retry) or 0) + 1
+                    failStreak = failStreak + 1
                     if item.retry > (tonumber(config.RETRY_MAX) or 5) then
                         log.error("push", "重试超限，放弃这条（消息已丢）")
                         led.setFault(5)
+                        led.setAlert(tonumber(config.LOST_ALERT_MINUTES) or 0)
                     else
                         util_queue.push(item)
-                        log.warn("push", "失败, 第 " .. item.retry .. " 次重试")
+                        log.warn("push", "失败, 第 " .. item.retry .. " 次重试",
+                                 "连续失败=" .. failStreak)
                     end
+
+                    -- 第一道：连续失败 2 次 → 切飞行模式重建网络（几秒，队列不丢）
+                    local flyN = tonumber(config.FAIL_FLYMODE_COUNT) or 0
+                    if flyN > 0 and failStreak % flyN == 0 then
+                        doNetReset("连续失败 " .. failStreak .. " 次")
+                        sys.wait(5000)
+                    end
+
+                    -- 第二道：连续失败够多 → 重启整机（最后手段）
+                    local need = tonumber(config.FAIL_REBOOT_COUNT) or 0
+                    if need > 0 and failStreak >= need then
+                        local maxDaily = tonumber(config.FAIL_REBOOT_DAILY_MAX) or 3
+                        local now = uptimeMs()
+                        if rebootWindowStart == 0 or (now - rebootWindowStart) > 86400000 then
+                            rebootWindowStart = now
+                            rebootInWindow = 0
+                        end
+                        if rebootInWindow < maxDaily then
+                            rebootInWindow = rebootInWindow + 1
+                            doRestart("连续推送失败 " .. failStreak .. " 次")
+                        else
+                            log.error("main", "24 小时内已重启 " .. rebootInWindow ..
+                                      " 次，不再自动重启（等人工处理）")
+                        end
+                    end
+
                     sys.wait(tonumber(config.RETRY_GAP_MS) or 30000)
                 end
             end
@@ -191,6 +324,23 @@ sys.taskInit(function()
         end
     end
 end)
+
+--============================================================
+-- 定时重启：按"运行时长"算，不依赖 NTP
+-- 依据：实测这台设备运行 23~24 小时后数据面和 SMS 接收会同时劣化，
+--       重启是唯一已知有效的恢复手段。这不是遮羞布，是针对固件缺陷的妥协。
+--============================================================
+sys.timerLoopStart(function()
+    local ok, err = pcall(function()
+        local h = tonumber(config.REBOOT_AFTER_HOURS) or 0
+        if h <= 0 then return end
+        local ms = uptimeMs()
+        if ms > 0 and ms >= h * 3600000 then
+            doRestart("运行已满 " .. h .. " 小时")
+        end
+    end)
+    if not ok then log.error("main", "定时重启任务异常: " .. tostring(err)) end
+end, 600000)   -- 每 10 分钟检查一次
 
 --============================================================
 -- 每小时回收一次堆
